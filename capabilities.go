@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 
+	"github.com/opcoder0/capabilities/internal"
 	"golang.org/x/sys/unix"
 )
 
@@ -28,25 +29,10 @@ const (
 	Ambient CapabilitySet = 4
 )
 
-// capabilityV1 is the Capability structure for LINUX_CAPABILITY_VERSION_1
-type capabilityV1 struct {
-	header unix.CapUserHeader
-	data   unix.CapUserData
-}
-
-// capabilityV3 is the Capability structure for LINUX_CAPABILITY_VERSION_2
-// or LINUX_CAPABILITY_VERSION_3
-type capabilityV3 struct {
-	header  unix.CapUserHeader
-	datap   [2]unix.CapUserData
-	bounds  [2]uint32
-	ambient [2]uint32
-}
-
 // Capabilities holds the capabilities header and data
 type Capabilities struct {
-	v3 capabilityV3
-	v1 capabilityV1
+	v3 internal.CapabilityV3
+	v1 internal.CapabilityV1
 	// Version has values 1, 2 or 3 depending on the kernel version.
 	// Prior to 2.6.25 value is set to 1.
 	// For Linux 2.6.25 added 64-bit capability sets the value is set to 2.
@@ -69,13 +55,13 @@ func Init() (*Capabilities, error) {
 	switch header.Version {
 	case unix.LINUX_CAPABILITY_VERSION_1:
 		capability.Version = 1
-		capability.v1.header = header
+		capability.v1.Header = header
 	case unix.LINUX_CAPABILITY_VERSION_2:
 		capability.Version = 2
-		capability.v3.header = header
+		capability.v3.Header = header
 	case unix.LINUX_CAPABILITY_VERSION_3:
 		capability.Version = 3
-		capability.v3.header = header
+		capability.v3.Header = header
 	default:
 		panic("Unsupported Linux capability version")
 	}
@@ -83,67 +69,57 @@ func Init() (*Capabilities, error) {
 }
 
 // IsSet returns true if the capability from the capability list
-// (unix.CAP_*) is set for the current process in the capSet CapabilitySet.
+// (unix.CAP_*) is set for the pid in the capSet CapabilitySet.
 // Returns false with nil error if the capability is not set.
 // Returns false with an error if there was an error getting capability.
-func (c *Capabilities) IsSet(capability int, capSet CapabilitySet) (bool, error) {
+func (c *Capabilities) IsSet(pid, capability int, capSet CapabilitySet) (bool, error) {
+	return c.isSetFor(os.Getpid(), capability, capSet)
+}
+
+func (c *Capabilities) isSetFor(pid, capability int, capSet CapabilitySet) (bool, error) {
 	if c.Version < 1 || c.Version > 3 {
 		return false, errors.New("invalid capability version")
 	}
 	if c.Version == 1 {
-		c.v1.header.Version = unix.LINUX_CAPABILITY_VERSION_1
-		c.v1.header.Pid = int32(os.Getpid())
-		err := unix.Capget(&c.v1.header, &c.v1.data)
+		c.v1.Header.Version = unix.LINUX_CAPABILITY_VERSION_1
+		c.v1.Header.Pid = int32(pid)
+		err := unix.Capget(&c.v1.Header, &c.v1.Data)
 		if err != nil {
 			return false, err
 		}
-		return c.v1.isSet(capability, capSet), nil
+		switch capSet {
+		case Effective:
+			return c.v1.IsEffectiveSet(capability), nil
+		case Inheritable:
+			return c.v1.IsInheritableSet(capability), nil
+		case Permitted:
+			return c.v1.IsPermittedSet(capability), nil
+		default:
+			return false, errors.New("invalid capability set for capability v1")
+		}
 	}
 	if c.Version == 2 {
-		c.v3.header.Version = unix.LINUX_CAPABILITY_VERSION_2
+		c.v3.Header.Version = unix.LINUX_CAPABILITY_VERSION_2
 	} else if c.Version == 3 {
-		c.v3.header.Version = unix.LINUX_CAPABILITY_VERSION_3
+		c.v3.Header.Version = unix.LINUX_CAPABILITY_VERSION_3
 	}
-	c.v3.header.Pid = int32(os.Getpid())
-	err := unix.Capget(&c.v3.header, &c.v3.datap[0])
+	c.v3.Header.Pid = int32(pid)
+	err := unix.Capget(&c.v3.Header, &c.v3.Datap[0])
 	if err != nil {
 		return false, err
 	}
-	return c.v3.isSet(capability, capSet), nil
-}
-
-func (v1 *capabilityV1) isSet(capability int, capSet CapabilitySet) bool {
 	switch capSet {
 	case Effective:
-		return (1<<uint(capability))&v1.data.Effective != 0
+		return c.v3.IsEffectiveSet(capability), nil
 	case Permitted:
-		return (1<<uint(capability))&v1.data.Permitted != 0
+		return c.v3.IsPermittedSet(capability), nil
 	case Inheritable:
-		return (1<<uint(capability))&v1.data.Inheritable != 0
-	}
-	return false
-}
-
-func (v3 *capabilityV3) isSet(capability int, capSet CapabilitySet) bool {
-
-	var i uint
-
-	bitIndex := capability
-	if bitIndex > 31 {
-		i = 1
-		bitIndex %= 32
-	}
-	switch capSet {
-	case Effective:
-		return (1<<uint(bitIndex))&v3.datap[i].Effective != 0
-	case Permitted:
-		return (1<<uint(bitIndex))&v3.datap[i].Permitted != 0
-	case Inheritable:
-		return (1<<uint(bitIndex))&v3.datap[i].Inheritable != 0
+		return c.v3.IsInheritableSet(capability), nil
 	case Bounding:
-		return (1<<uint(bitIndex))&v3.bounds[i] != 0
+		return c.v3.IsBoundingSet(capability), nil
 	case Ambient:
-		return (1<<uint(bitIndex))&v3.ambient[i] != 0
+		return c.v3.IsAmbientSet(capability), nil
+	default:
+		return false, errors.New("invalid capability set for capability v2 or v3")
 	}
-	return false
 }
